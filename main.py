@@ -1,8 +1,9 @@
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, APIRouter, Request
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 import re
 import os
+import httpx
 
 app = FastAPI(title="MK Finder MVP", version="0.1.0")
 
@@ -69,6 +70,9 @@ DISTRITOS_MAP = {
 TIPOS = ["departamento", "casa", "dúplex", "duplex", "flat", "oficina", "local", "terreno"]
 AMENIDADES = ["cochera", "ascensor", "terraza", "amoblado", "pet friendly", "pet-friendly", "estreno", "frente a parque", "cuarto de servicio", "baño de servicio"]
 
+# -----------------------------
+# 2) Modelos
+# -----------------------------
 class NLURequest(BaseModel):
     query: str = Field(..., description="Búsqueda en lenguaje natural")
 
@@ -95,8 +99,11 @@ class BuscarRequest(BaseModel):
     query: Optional[str] = None
     filtros: Optional[ConsultaEstructurada] = None
 
+# -----------------------------
+# 3) Parsers (regex/heurísticas)
+# -----------------------------
 _money_pattern = re.compile(r"(\$|usd|dolares|dólares|\bs\/?|soles)\s*(\d+[\d\.,]*)", re.IGNORECASE)
-_range_money_pattern = re.compile(r"(hasta|max(?:imo)?|tope)\s*(\$|usd|s\/?|soles)?\s*(\d+[\d\.,]*)|entre\s*(\d+[\d\.,]*)\s*(y|-|a)\s*(\d+[\d\.,]*)\s*(usd|\$|s\/?|soles)?", re.IGNORECASE)
+_range_money_pattern = re.compile(r"(hasta|max(?:imo)?|tope)\s*(\$|usd|s\/?|soles)?\s*(\d+[\d\.,])|entre\s(\d+[\d\.,])\s(y|-|a)\s*(\d+[\d\.,])\s(usd|\$|s\/?|soles)?", re.IGNORECASE)
 _area_pattern = re.compile(r"(m2|m²)")
 _number_pattern = re.compile(r"\d+[\.,]?\d*")
 _dorm_pattern = re.compile(r"(\d+)\s*(dorm|dormitorio|habitaci[oó]n|hab)", re.IGNORECASE)
@@ -139,7 +146,7 @@ def parse_query_to_filters(texto: str) -> ConsultaEstructurada:
     # Precio (rango o tope)
     m_range = _range_money_pattern.search(t)
     if m_range:
-        if m_range.group(3):  # caso: hasta 2500 soles
+        if m_range.group(3):  # hasta 2500 soles
             result.precio_max = _to_float(m_range.group(3))
             mon = _norm_moneda(m_range.group(2) or "")
             if mon: result.moneda = mon
@@ -244,7 +251,7 @@ MOCK_DATA: List[Dict[str, Any]] = [
 ]
 
 # -----------------------------
-# 5) Validadores y endpoints principales
+# 5) Validación, match y endpoints
 # -----------------------------
 def _is_valid_consulta(c: ConsultaEstructurada) -> bool:
     if not c.distritos:
@@ -304,14 +311,53 @@ def buscar(req: BuscarRequest) -> Dict[str, Any]:
         "results": matches
     }
 
-# Telegram webhook router (import below)
-from bot.telegram_webhook import router as tg_router
-app.include_router(tg_router)
+# ============================================================
+# 6) Telegram Webhook (inline, sin imports externos)
+# ============================================================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
+async def _tg_send_message(chat_id: int, text: str) -> None:
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        await client.post(api, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
+
+@app.post("/bot/telegram/webhook")
+async def tg_webhook(request: Request):
+    payload = await request.json()
+    message = payload.get("message") or payload.get("edited_message")
+    if not message:
+        return {"ok": True}
+
+    chat_id = message["chat"]["id"]
+    text = (message.get("text") or "").strip()
+
+    if not text:
+        await _tg_send_message(chat_id, "Envíame lo que buscas. Ej: ‘Venta en Miraflores y San Isidro, 2 dorm, hasta 250k usd, con ascensor’.")
+        return {"ok": True}
+
+    consulta = parse_query_to_filters(text)
+    if not _is_valid_consulta(consulta):
+        await _tg_send_message(chat_id, "Necesito al menos un distrito y un parámetro extra (tipo, precio, m², dormitorios/baños o amenidades).")
+        return {"ok": True}
+
+    matches = [p for p in MOCK_DATA if _match(p, consulta)]
+    if not matches:
+        await _tg_send_message(chat_id, "No encontré coincidencias en el demo. Ajusta filtros o prueba otro distrito.")
+        return {"ok": True}
+
+    lines = [f"<b>{m['titulo']}</b>\n{m['operacion'].title()} · {m['tipo']} · {m['distrito']}\n{m['moneda']} {m['precio']:,}\n{m['url_aviso']}" for m in matches[:5]]
+    await _tg_send_message(chat_id, "\n\n".join(lines))
+    return {"ok": True}
+
+# -----------------------------
+# 7) Health & raíz
+# -----------------------------
 @app.get("/health")
 def health():
     return {"ok": True, "service": "MK Finder MVP", "telegram": bool(os.getenv("TELEGRAM_BOT_TOKEN"))}
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "MK Finder MVP"} 
+    return {"ok": True, "service": "MK Finder MVP"}
