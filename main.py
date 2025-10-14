@@ -2,54 +2,20 @@
 from fastapi import FastAPI, Request
 import os
 import httpx
+from adapters.urbania import UrbaniaAdapter
 
 # =============================
 # 🔧 Configuración básica
 # =============================
 app = FastAPI(title="MK Finder MVP")
 
-# Lee el token desde las variables de entorno
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # =============================
-# 🧩 Datos MOCK para demo
+# 🧠 Función de parsing del texto
 # =============================
-MOCK_DATA = [
-    {
-        "titulo": "Departamento moderno en Miraflores",
-        "operacion": "venta",
-        "tipo": "departamento",
-        "distrito": "Miraflores",
-        "precio": 230000,
-        "moneda": "USD",
-        "url_aviso": "https://urbania.pe/inmueble/departamento-en-venta-miraflores-230000usd",
-    },
-    {
-        "titulo": "Departamento con vista al parque en San Isidro",
-        "operacion": "venta",
-        "tipo": "departamento",
-        "distrito": "San Isidro",
-        "precio": 245000,
-        "moneda": "USD",
-        "url_aviso": "https://urbania.pe/inmueble/departamento-en-venta-san-isidro-245000usd",
-    },
-    {
-        "titulo": "Flat en Surco con cochera",
-        "operacion": "venta",
-        "tipo": "departamento",
-        "distrito": "Surco",
-        "precio": 180000,
-        "moneda": "USD",
-        "url_aviso": "https://urbania.pe/inmueble/departamento-en-venta-surco-180000usd",
-    },
-]
-
-# =============================
-# 🧠 Funciones de búsqueda mock
-# =============================
-
 def parse_query_to_filters(query: str) -> dict:
-    """Convierte el texto libre en filtros simples"""
+    """Convierte texto libre en filtros estructurados (detecta moneda, distritos, etc.)."""
     query = query.lower()
     filtros = {
         "distritos": [],
@@ -57,18 +23,29 @@ def parse_query_to_filters(query: str) -> dict:
         "dormitorios": None,
         "operacion": None,
         "tipo": None,
+        "moneda": None,
         "ascensor": "ascensor" in query,
     }
+
+    # Operación
     if "venta" in query:
         filtros["operacion"] = "venta"
-    elif "alquiler" in query:
+    elif "alquiler" in query or "renta" in query:
         filtros["operacion"] = "alquiler"
 
-    for d in ["miraflores", "san isidro", "surco", "san borja", "barranco"]:
+    # Distritos
+    for d in ["miraflores", "san isidro", "surco", "san borja", "barranco", "magdalena", "la molina", "jesus maria"]:
         if d in query:
             filtros["distritos"].append(d.title())
 
-    for palabra in query.split():
+    # Moneda
+    if "usd" in query or "$" in query or "dólar" in query or "dolares" in query:
+        filtros["moneda"] = "USD"
+    elif "sol" in query or "soles" in query or "pen" in query:
+        filtros["moneda"] = "PEN"
+
+    # Precio y dormitorios
+    for palabra in query.replace(",", " ").split():
         if "k" in palabra:
             try:
                 filtros["precio_max"] = int(float(palabra.replace("k", "")) * 1000)
@@ -78,23 +55,13 @@ def parse_query_to_filters(query: str) -> dict:
             filtros["precio_max"] = int(palabra)
         elif palabra.isdigit() and int(palabra) <= 10:
             filtros["dormitorios"] = int(palabra)
+
     return filtros
 
 
 def _is_valid_consulta(filtros: dict) -> bool:
     return len(filtros["distritos"]) > 0
 
-
-def _match(prop: dict, filtros: dict) -> bool:
-    if filtros["operacion"] and prop["operacion"] != filtros["operacion"]:
-        return False
-    if filtros["tipo"] and prop["tipo"] != filtros["tipo"]:
-        return False
-    if filtros["distritos"] and prop["distrito"] not in filtros["distritos"]:
-        return False
-    if filtros["precio_max"] and prop["precio"] > filtros["precio_max"]:
-        return False
-    return True
 
 # =============================
 # 💬 Función para enviar mensaje a Telegram
@@ -107,10 +74,7 @@ async def _tg_send_message(chat_id: int, text: str) -> None:
     api = f"https://api.telegram.org/bot{token}/sendMessage"
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
-            await client.post(
-                api,
-                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-            )
+            await client.post(api, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
             print(f"✅ Mensaje enviado a chat_id={chat_id}")
         except Exception as e:
             print(f"❌ Error enviando mensaje: {e}")
@@ -132,21 +96,45 @@ async def tg_webhook(request: Request):
         await _tg_send_message(chat_id, "Envíame lo que buscas. Ejemplo: ‘Venta en Miraflores, 2 dorm, hasta 250k usd’.")
         return {"ok": True}
 
+    # Parseo del texto
     consulta = parse_query_to_filters(text)
+
+    # Validación de entrada
     if not _is_valid_consulta(consulta):
         await _tg_send_message(chat_id, "Necesito al menos un distrito (Miraflores, Surco, etc.) y algún filtro adicional como precio, m² o dormitorios.")
         return {"ok": True}
 
-    matches = [p for p in MOCK_DATA if _match(p, consulta)]
-    if not matches:
-        await _tg_send_message(chat_id, "No encontré coincidencias demo. Ajusta los filtros o prueba otro distrito.")
+    # Si no especificó moneda, preguntar
+    if not consulta.get("moneda"):
+        await _tg_send_message(chat_id, "¿En qué moneda deseas buscar propiedades? 💰\n\nResponde escribiendo USD o Soles.")
         return {"ok": True}
 
-    lines = [
-        f"<b>{m['titulo']}</b>\n{m['operacion'].title()} · {m['tipo']} · {m['distrito']}\n"
-        f"{m['moneda']} {m['precio']:,}\n{m['url_aviso']}"
-        for m in matches[:5]
-    ]
+    # Llamar a Urbania
+    adapter = UrbaniaAdapter()
+    await _tg_send_message(chat_id, "🔍 Buscando propiedades en Urbania, un momento por favor...")
+
+    try:
+        resultados = await adapter.buscar(consulta)
+    except Exception as e:
+        print(f"Error al buscar en Urbania: {e}")
+        await _tg_send_message(chat_id, "❌ Ocurrió un error al conectar con Urbania.")
+        return {"ok": True}
+
+    if not resultados:
+        await _tg_send_message(chat_id, "No encontré coincidencias en Urbania. Ajusta los filtros o prueba otro distrito.")
+        return {"ok": True}
+
+    # Mostrar los primeros resultados
+    lines = []
+    for m in resultados[:5]:
+        line = (
+            f"<b>{m.get('titulo','(sin título)')}</b>\n"
+            f"{m.get('operacion','').title()} · {m.get('tipo','')} · {m.get('distrito','')}\n"
+            f"{m.get('moneda','')} {m.get('precio',''):,}\n"
+            f"{m.get('url_aviso','')}"
+        )
+        lines.append(line)
+
     await _tg_send_message(chat_id, "\n\n".join(lines))
     return {"ok": True}
 
@@ -162,7 +150,7 @@ def health():
     }
 
 # =============================
-# ✅ Inicio de app (para Railway)
+# ✅ Inicio local o Railway
 # =============================
 if __name__ == "__main__":
     import uvicorn
