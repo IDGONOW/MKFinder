@@ -15,18 +15,21 @@ def health():
         "service": "MK Finder MVP",
         "telegram": bool(TELEGRAM_BOT_TOKEN)
     }
+from adapters.urbania_playwright import UrbaniaPlayAdapter
 
 @app.get("/test/urbania")
 async def test_urbania():
-    adapter = UrbaniaAdapter()
+    adapter = UrbaniaPlayAdapter()
     consulta = {
-        "operacion": "venta",
+        "operacion": "venta",        # o "alquiler"
         "distritos": ["miraflores"],
-        "precio_max": 300000,
-        "moneda": "USD"
+        "dormitorios": 2,
+        "precio_max": 250000,
+        "moneda": "USD"              # o "PEN"
     }
     res = await adapter.buscar(consulta)
     return {"count": len(res), "sample": res[:5]}
+
 
 # Webhook de Telegram (solo placeholder para probar)
 @app.post("/bot/telegram/webhook")
